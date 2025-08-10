@@ -1,0 +1,123 @@
+# Business RAG System - .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# uv
+uv.lock
+.uv-cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Data files (you might want to keep some of these)
+data/chunks/
+data/embeddings/
+data/indexes/
+*.pkl
+*.joblib
+
+# Documents (OPTIONAL - you might want to track some test documents)
+# Uncomment next line if you don't want to track documents in git
+# documents/
+
+# Logs
+*.log
+logs/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb
+
+# Docker
+.dockerignore
+
+# API Keys and secrets
+secrets/
+credentials/
+keys/
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# ChromaDB
+chroma_db/
+*.db
+*.sqlite
+
+# Vector databases
+pinecone_index/
+faiss_index/
+
+# Model files (these can be large)
+models/
+*.bin
+*.safetensors
+pytorch_model.bin
+model.onnx
+
+# Large files (adjust as needed)
+*.zip
+*.tar.gz
+*.rar
+*.7z
