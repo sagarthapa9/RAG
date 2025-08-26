@@ -121,3 +121,6 @@ model.onnx
 *.tar.gz
 *.rar
 *.7z
+
+data/chromadb/model_cache/
+*.json

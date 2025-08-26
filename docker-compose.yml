@@ -1,26 +1,31 @@
 
 services:
-  # Development environment
+  # Development environment for FastAPI + LLM
   rag-dev:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: rag-dev
+    ports:
+      - "8080:8001"   # host:container
     volumes:
-      # Mount source code for live editing
       - ./src:/app/src
       - ./tests:/app/tests
       - ./documents:/app/documents
       - ./data:/app/data
+      - ./uploads_data:/app/data/uploads
       - ./.env:/app/.env
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
-      # Vector DB connection settings
+      # Vector DB settings (ChromaDB)
       - CHROMA_SERVER_HOST=chromadb
       - CHROMA_SERVER_HTTP_PORT=8000
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT}
+      - AZURE_OPENAI_API_VERSION=2024-12-01-preview
+
     stdin_open: true
     tty: true
     networks:
@@ -28,9 +33,9 @@ services:
     depends_on:
       chromadb:
         condition: service_healthy
-        required: false  # Don't require if not using ChromaDB profile
 
-  # ChromaDB for vector storage (Server mode)
+
+  #ChromaDB for vector storage
   chromadb:
     image: chromadb/chroma:latest
     container_name: business-rag-chromadb
@@ -41,14 +46,10 @@ services:
     environment:
       - CHROMA_SERVER_HOST=0.0.0.0
       - CHROMA_SERVER_HTTP_PORT=8000
-      # Optional: Add authentication
       - CHROMA_SERVER_AUTH_CREDENTIALS_FILE=/chroma/auth.txt
       - CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER=chromadb.auth.basic.BasicAuthCredentialsProvider
     networks:
       - rag-network
-    profiles:
-      - vector-db
-      - chromadb
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
       interval: 30s
@@ -56,100 +57,10 @@ services:
       retries: 3
       start_period: 40s
 
-  # Qdrant Vector Database (Alternative to ChromaDB)
-  # qdrant:
-  #   image: qdrant/qdrant:latest
-  #   container_name: business-rag-qdrant
-  #   ports:
-  #     - "6333:6333"  # REST API
-  #     - "6334:6334"  # gRPC API
-  #   volumes:
-  #     - qdrant_data:/qdrant/storage
-  #   environment:
-  #     - QDRANT__SERVICE__HTTP_PORT=6333
-  #     - QDRANT__SERVICE__GRPC_PORT=6334
-  #     # Optional: Enable CORS for web access
-  #     - QDRANT__SERVICE__ENABLE_CORS=true
-  #   networks:
-  #     - rag-network
-  #   profiles:
-  #     - vector-db
-  #     - qdrant
-  #   restart: unless-stopped
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-    #  start_period: 30s
-
-  # Streamlit UI (we'll use this later)
-  streamlit:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: business-rag-ui
-    command: streamlit run src/app.py --server.address 0.0.0.0 --server.port 8501
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./src:/app/src
-      - ./documents:/app/documents
-      - ./data:/app/data
-      - ./.env:/app/.env
-    environment:
-      - PYTHONPATH=/app/src
-      - PYTHONUNBUFFERED=1
-      # Vector DB connection settings
-      - CHROMA_SERVER_HOST=chromadb
-      - CHROMA_SERVER_HTTP_PORT=8000
-      - QDRANT_HOST=qdrant
-      - QDRANT_PORT=6333
-    depends_on:
-      chromadb:
-        condition: service_healthy
-        required: false
-      qdrant:
-        condition: service_healthy
-        required: false
-    networks:
-      - rag-network
-    profiles:
-      - ui  # Only start when we need UI
-
-
-
-  # Optional: PostgreSQL for metadata storage (future enhancement)
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: business-rag-postgres
-  #   ports:
-  #     - "5432:5432"
-  #   environment:
-  #     - POSTGRES_DB=rag_metadata
-  #     - POSTGRES_USER=rag_user
-  #     - POSTGRES_PASSWORD=rag_password
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
-  #   networks:
-  #     - rag-network
-  #   profiles:
-  #     - metadata-db
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U rag_user -d rag_metadata"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-
 networks:
   rag-network:
     driver: bridge
-    name: business-rag-network
 
 volumes:
   chromadb_data:
     name: business-rag-chromadb-data
-  qdrant_data:
-    name: business-rag-qdrant-data
-  postgres_data:
-    name: business-rag-postgres-data
