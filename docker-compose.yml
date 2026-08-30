@@ -21,18 +21,24 @@ services:
       # Vector DB settings (ChromaDB)
       - CHROMA_SERVER_HOST=chromadb
       - CHROMA_SERVER_HTTP_PORT=8000
-      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY}
-      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT}
-      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT}
-      - AZURE_OPENAI_API_VERSION=2024-12-01-preview
+      # LLM provider (provider-agnostic): LLM_PROVIDER picks the provider; the
+      # generic LLM_* vars fall back to the legacy KIMI_* ones so existing .env
+      # files keep working. See .env.example.
+      - LLM_PROVIDER=${LLM_PROVIDER:-kimi}
+      - LLM_API_KEY=${LLM_API_KEY:-${KIMI_API_KEY:-}}
+      - LLM_BASE_URL=${LLM_BASE_URL:-${KIMI_BASE_URL:-https://api.moonshot.cn/v1}}
+      - LLM_MODEL=${LLM_MODEL:-${KIMI_MODEL:-moonshot-v1-8k}}
 
     stdin_open: true
     tty: true
     networks:
       - rag-network
     depends_on:
-      chromadb:
-        condition: service_healthy
+      # The RAG code uses ChromaDB's embedded PersistentClient (see
+      # vector_store.py) and never connects to the server service, so don't
+      # block rag-dev startup on the server's health. The service is still
+      # started for convenience (Chroma web UI / future server mode).
+      - chromadb
 
 
   #ChromaDB for vector storage
@@ -46,8 +52,11 @@ services:
     environment:
       - CHROMA_SERVER_HOST=0.0.0.0
       - CHROMA_SERVER_HTTP_PORT=8000
-      - CHROMA_SERVER_AUTH_CREDENTIALS_FILE=/chroma/auth.txt
-      - CHROMA_SERVER_AUTH_CREDENTIALS_PROVIDER=chromadb.auth.basic.BasicAuthCredentialsProvider
+      # Auth was removed: CHROMA_SERVER_AUTH_CREDENTIALS_FILE pointed at
+      # /chroma/auth.txt but no such file was ever mounted, so the container
+      # failed to start. The RAG code uses the embedded PersistentClient anyway
+      # (it never connects to this server), so auth here only blocks startup.
+      # Re-add with a real credentials file if you ever switch to server mode.
     networks:
       - rag-network
     healthcheck:

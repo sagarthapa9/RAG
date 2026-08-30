@@ -2,64 +2,61 @@
 Fixed ChromaVectorStore with proper abstract method implementations
 """
 
+import hashlib
 import os
 import logging
 from typing import List, Dict, Any, Optional, Tuple
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
-import numpy as np
-from langchain.schema import Document
-from langchain.vectorstores.base import VectorStore
-from langchain.schema.retriever import BaseRetriever
-from langchain.callbacks.manager import CallbackManagerForRetrieverRun
+from pydantic import Field
+from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 
 logger = logging.getLogger(__name__)
 
 
 class ChromaRetriever(BaseRetriever):
     """Custom retriever for ChromaVectorStore"""
-    
-    def __init__(self, vector_store, search_kwargs: Optional[Dict] = None):
-        """
-        Initialize the retriever
-        
-        Args:
-            vector_store: The ChromaVectorStore instance
-            search_kwargs: Search parameters like {"k": 5}
-        """
-        super().__init__()
-        self.vector_store = vector_store
-        self.search_kwargs = search_kwargs or {"k": 4}
-    
+
+    vector_store: Any
+    search_kwargs: Dict[str, Any] = Field(default_factory=lambda: {"k": 4})
+
     def _get_relevant_documents(
         self,
         query: str,
         *,
-        run_manager: CallbackManagerForRetrieverRun
+        run_manager: CallbackManagerForRetrieverRun,
     ) -> List[Document]:
         """
         Get relevant documents for a query
-        
+
         Args:
             query: Search query
             run_manager: Callback manager
-            
+
         Returns:
             List of relevant documents
         """
         return self.vector_store.similarity_search(query, **self.search_kwargs)
 
 
-class ChromaVectorStore(VectorStore):
+class ChromaVectorStore:
     """
-    Custom ChromaDB vector store with all required abstract methods implemented
+    Custom ChromaDB vector store.
+
+    Plain class (not a LangChain VectorStore subclass): LangChain's base
+    became a pydantic model that fights arbitrary attributes across versions.
+    The methods LangChain needs are still implemented (add_documents,
+    add_texts, similarity_search, similarity_search_with_score, as_retriever),
+    so it drops into chains/retrievers that expect that surface.
     """
     
     def __init__(
         self,
         collection_name: str = "business_documents",
-        persist_directory: str = "./data/chroma_db",
+        persist_directory: str = "./data/chromadb",
         embedding_model: str = "all-MiniLM-L6-v2"
     ):
         """
@@ -116,11 +113,7 @@ class ChromaVectorStore(VectorStore):
         try:
             self.client = chromadb.PersistentClient(
                 path=persist_directory,
-                settings=Settings(
-                    anonymized_telemetry=False,
-                    allow_reset=True,
-                    is_persistent=True
-                )
+                settings=Settings(allow_reset=True)
             )
             
             # Get or create collection
@@ -131,6 +124,15 @@ class ChromaVectorStore(VectorStore):
             
             logger.info(f"ChromaDB initialized with collection: {collection_name}")
             logger.info(f"Collection document count: {self.collection.count()}")
+
+            # Warm up: force Chroma to finish loading the HNSW vector index
+            # before any query is served. count() reads SQLite metadata and is
+            # correct immediately, but query() reads the in-memory index — which
+            # can come back empty on a cold start right after a crash/force-kill
+            # (the known index/metadata out-of-sync failure mode). get() blocks
+            # until the index segments are loaded, so one cheap read here makes
+            # the first real query reliable.
+            self.collection.get(limit=1)
             
         except Exception as e:
             logger.error(f"Failed to initialize ChromaDB: {str(e)}")
@@ -142,10 +144,7 @@ class ChromaVectorStore(VectorStore):
                 
                 self.client = chromadb.PersistentClient(
                     path=fallback_dir,
-                    settings=Settings(
-                        anonymized_telemetry=False,
-                        allow_reset=True
-                    )
+                    settings=Settings(allow_reset=True)
                 )
                 
                 self.collection = self.client.get_or_create_collection(
@@ -182,8 +181,12 @@ class ChromaVectorStore(VectorStore):
             embeddings = self.embedding_model.encode(texts, convert_to_tensor=False)
             embeddings_list = embeddings.tolist()
             
-            # Generate IDs
-            ids = [f"doc_{i}_{hash(text) % 1000000}" for i, text in enumerate(texts)]
+            # Generate stable IDs (content hash, not builtin hash() which is
+            # salted per-process and would duplicate chunks on re-ingestion)
+            ids = [
+                f"doc_{i}_{hashlib.md5(text.encode('utf-8', errors='ignore')).hexdigest()[:12]}"
+                for i, text in enumerate(texts)
+            ]
             
             # Add to collection
             self.collection.add(
@@ -256,6 +259,23 @@ class ChromaVectorStore(VectorStore):
                 n_results=k,
                 where=filter
             )
+
+            # An empty result needs a reason. With no filter, an empty result on
+            # a non-empty collection means the HNSW index wasn't loaded yet (any
+            # query gets top-k); retry once. With a filter, 0 hits usually means
+            # the filter matched nothing — log it so it's never a silent mystery.
+            if not (results['documents'] and results['documents'][0]):
+                logger.warning(
+                    "Similarity search returned 0 hits: query=%r k=%s where=%r (collection count=%d)",
+                    query, k, filter, self.collection.count()
+                )
+                if not filter and self.collection.count() > 0:
+                    logger.warning("Cold-start: retrying once (index may not be loaded yet)")
+                    results = self.collection.query(
+                        query_embeddings=[query_embedding_list],
+                        n_results=k,
+                        where=filter
+                    )
             
             # Convert results to Document objects
             documents = []
@@ -272,9 +292,11 @@ class ChromaVectorStore(VectorStore):
             
             logger.info(f"Found {len(documents)} similar documents for query")
             return documents
-            
+
         except Exception as e:
-            logger.error(f"Error in similarity search: {str(e)}")
+            # Not silent: log the full traceback so an empty result is never
+            # mistaken for "no documents matched" when it's actually a failure.
+            logger.exception("Error in similarity search: %s", e)
             return []
     
     def similarity_search_with_score(
@@ -306,6 +328,23 @@ class ChromaVectorStore(VectorStore):
                 n_results=k,
                 where=filter
             )
+
+            # An empty result needs a reason. With no filter, an empty result on
+            # a non-empty collection means the HNSW index wasn't loaded yet (any
+            # query gets top-k); retry once. With a filter, 0 hits usually means
+            # the filter matched nothing — log it so it's never a silent mystery.
+            if not (results['documents'] and results['documents'][0]):
+                logger.warning(
+                    "Similarity search returned 0 hits: query=%r k=%s where=%r (collection count=%d)",
+                    query, k, filter, self.collection.count()
+                )
+                if not filter and self.collection.count() > 0:
+                    logger.warning("Cold-start: retrying once (index may not be loaded yet)")
+                    results = self.collection.query(
+                        query_embeddings=[query_embedding_list],
+                        n_results=k,
+                        where=filter
+                    )
             
             # Convert results to Document objects with scores
             documents_with_scores = []
@@ -323,9 +362,9 @@ class ChromaVectorStore(VectorStore):
             
             logger.info(f"Found {len(documents_with_scores)} similar documents with scores")
             return documents_with_scores
-            
+
         except Exception as e:
-            logger.error(f"Error in similarity search with score: {str(e)}")
+            logger.exception("Error in similarity search with score: %s", e)
             return []
     
     def _get_relevant_documents(self, query: str) -> List[Document]:
@@ -405,7 +444,7 @@ class ChromaVectorStore(VectorStore):
         embedding_model: str = "all-MiniLM-L6-v2",
         metadatas: Optional[List[Dict]] = None,
         collection_name: str = "business_documents",
-        persist_directory: str = "./data/chroma_db",
+        persist_directory: str = "./data/chromadb",
         **kwargs
     ) -> "ChromaVectorStore":
         """
@@ -438,7 +477,7 @@ class ChromaVectorStore(VectorStore):
         documents: List[Document],
         embedding_model: str = "all-MiniLM-L6-v2",
         collection_name: str = "business_documents",
-        persist_directory: str = "./data/chroma_db",
+        persist_directory: str = "./data/chromadb",
         **kwargs
     ) -> "ChromaVectorStore":
         """
@@ -467,7 +506,7 @@ class ChromaVectorStore(VectorStore):
 
 def create_vector_store(
     collection_name: str = "business_documents",
-    persist_directory: str = "./data/chroma_db",
+    persist_directory: str = "./data/chromadb",
     embedding_model: str = "all-MiniLM-L6-v2"
 ) -> ChromaVectorStore:
     """

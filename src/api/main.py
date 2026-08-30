@@ -12,10 +12,16 @@ import logging
 from datetime import datetime
 import json
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
+
+# Make INFO logs (vector-store state, retrieval counts, errors) visible in the
+# terminal. uvicorn's default config suppresses app-level INFO lines, which
+# made "empty vector store" / retrieval failures look like silent empty answers.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
 # Your existing imports
-from src.rag.pipeline import RAGPipeline
-from src.rag.llm_rag import LLMRAGPipeline, AzureLLMConfig, RAGAnswer
+from rag.pipeline import RAGPipeline
+from rag.llm_rag import LLMRAGPipeline, LLMConfig, RAGAnswer
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +30,13 @@ retriever = None
 llm_rag_pipeline = None
 
 # Configuration
-UPLOAD_DIRECTORY = "./data/uploads"
+# Paths are anchored to the project root (src/api/main.py -> parents[2]) so the
+# app works regardless of the process working directory.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# Load .env from the project root (gitignored; see .env.example). Existing
+# shell-exported env vars win, since load_dotenv won't override by default.
+load_dotenv(PROJECT_ROOT / ".env")
+UPLOAD_DIRECTORY = str(PROJECT_ROOT / "data" / "uploads")
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".docx", ".doc", ".md", ".rtf", ".csv", ".json"}
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -129,10 +141,10 @@ def setup_environment():
     
     # Create necessary directories
     directories = [
-        "./data",
-        "./data/chromadb", 
-        "./data/documents",
-        "./logs"
+        str(PROJECT_ROOT / "data"),
+        str(PROJECT_ROOT / "data" / "chromadb"),
+        str(PROJECT_ROOT / "data" / "documents"),
+        str(PROJECT_ROOT / "logs")
     ]
     
     for directory in directories:
@@ -161,7 +173,7 @@ def initialize_rag_pipeline() -> RAGPipeline:
             "chunk_size": int(os.getenv("CHUNK_SIZE", "512")),
             "chunk_overlap": int(os.getenv("CHUNK_OVERLAP", "50")),
             "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
-            "persist_directory": os.getenv("VECTOR_STORE_PATH", "./data/chromadb"),
+            "persist_directory": os.getenv("VECTOR_STORE_PATH", str(PROJECT_ROOT / "data" / "chromadb")),
             "collection_name": os.getenv("COLLECTION_NAME", "business_documents")
         }
         
@@ -201,20 +213,14 @@ def initialize_llm_rag_pipeline(rag_pipeline: RAGPipeline) -> Optional[LLMRAGPip
     """Initialize the LLM RAG pipeline for question answering"""
     
     try:
-        # Azure OpenAI configuration
-        azure_config = {
-            'api_key': os.getenv("AZURE_OPENAI_API_KEY"),
-            'azure_endpoint': os.getenv("AZURE_OPENAI_ENDPOINT"),
-            'deployment': os.getenv("AZURE_OPENAI_DEPLOYMENT"),
-            'api_version': os.getenv("AZURE_OPENAI_API_VERSION"),
-            'temperature': float(os.getenv("LLM_TEMPERATURE", "0.1")),
-            'max_tokens': int(os.getenv("LLM_MAX_TOKENS", "1024"))
-        }
-        
-        logger.info("Initializing Azure LLM configuration...")
-        
+        # Provider-agnostic LLM configuration from env vars (see llm_rag.LLMConfig):
+        # provider is chosen via LLM_PROVIDER. LLMConfig raises if the chosen
+        # provider's key is missing, so Q&A stays gracefully unavailable (503)
+        # until a .env with a real key is provided.
+        logger.info("Initializing LLM configuration...")
+
         # Create LLM config
-        llm_config = AzureLLMConfig(**azure_config)
+        llm_config = LLMConfig()
         
         # Custom system prompt for business documents
         system_prompt = """You are a helpful AI assistant that answers questions based on business documents and company information.
@@ -287,8 +293,9 @@ async def health_check():
     if llm_rag_pipeline:
         try:
             status["llm_info"] = {
+                "provider": llm_rag_pipeline.llm_config.provider,
                 "model": llm_rag_pipeline.llm_config.model,
-                "deployment": llm_rag_pipeline.llm_config.deployment,
+                "base_url": llm_rag_pipeline.llm_config.base_url,
                 "temperature": llm_rag_pipeline.llm_config.temperature,
                 "max_tokens": llm_rag_pipeline.llm_config.max_tokens
             }
@@ -317,11 +324,11 @@ async def get_system_info():
     if llm_rag_pipeline:
         info["llm_system"] = {
             "available": True,
+            "provider": llm_rag_pipeline.llm_config.provider,
             "model": llm_rag_pipeline.llm_config.model,
-            "deployment": llm_rag_pipeline.llm_config.deployment,
+            "base_url": llm_rag_pipeline.llm_config.base_url,
             "temperature": llm_rag_pipeline.llm_config.temperature,
             "max_tokens": llm_rag_pipeline.llm_config.max_tokens,
-            "endpoint": llm_rag_pipeline.llm_config.azure_endpoint
         }
     else:
         info["llm_system"] = {"available": False, "error": "LLM pipeline not initialized"}
@@ -370,6 +377,14 @@ async def ask_question(request: QuestionRequest):
         if request.max_tokens is not None:
             llm_overrides['max_tokens'] = request.max_tokens
         
+        # Log the exact request — a stray filter_metadata silently returning
+        # 0 hits has been the root cause of "not enough information" answers.
+        logger.info(
+            "Q&A request: question=%r k=%s filter_metadata=%r temperature=%s max_tokens=%s",
+            request.question, request.k, request.filter_metadata,
+            request.temperature, request.max_tokens
+        )
+
         # Get answer from LLM RAG pipeline
         answer: RAGAnswer = llm_rag.answer(
             query=request.question,
@@ -502,8 +517,9 @@ async def get_upload_status():
             llm_rag = get_llm_rag_pipeline()
             llm_system_info = {
                 "available": True,
+                "provider": llm_rag.llm_config.provider,
                 "model": llm_rag.llm_config.model,
-                "deployment": llm_rag.llm_config.deployment,
+                "base_url": llm_rag.llm_config.base_url,
                 "temperature": llm_rag.llm_config.temperature,
                 "max_tokens": llm_rag.llm_config.max_tokens
             }
@@ -663,8 +679,9 @@ async def qa_health_check():
             "status": "healthy",
             "rag_pipeline": "available",
             "llm_pipeline": "available",
+            "provider": llm_rag_pipeline.llm_config.provider,
             "model": llm_rag_pipeline.llm_config.model,
-            "deployment": llm_rag_pipeline.llm_config.deployment,
+            "base_url": llm_rag_pipeline.llm_config.base_url,
             "test_successful": True
         }
         

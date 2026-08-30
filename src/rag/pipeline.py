@@ -115,7 +115,12 @@ class RAGPipeline:
             
             # Sanitize value
             sanitized_value = RAGPipeline._sanitize_metadata_value(value)
-            
+
+            # Empty containers can't be meaningful filters — e.g. Swagger's
+            # auto-generated placeholder {"additionalProp1": {}} — so drop them.
+            if isinstance(value, (dict, list, tuple)) and not value:
+                continue
+
             # Only include non-None values
             if sanitized_value is not None:
                 sanitized[key_str] = sanitized_value
@@ -277,6 +282,9 @@ class RAGPipeline:
             sanitized_filter = None
             if filter_metadata:
                 sanitized_filter = self._sanitize_metadata(filter_metadata)
+                if not sanitized_filter:
+                    # Everything dropped (e.g. Swagger's {} placeholder) == no filter
+                    sanitized_filter = None
             
             results = self.vector_store.similarity_search(
                 query=query,
@@ -285,9 +293,9 @@ class RAGPipeline:
             )
             logger.info(f"Found {len(results)} relevant documents for query: '{query[:50]}...'")
             return results
-            
+
         except Exception as e:
-            logger.error(f"Error searching documents: {e}")
+            logger.exception("Error searching documents: %s", e)
             return []
     
     def search_with_scores(
@@ -312,6 +320,9 @@ class RAGPipeline:
             sanitized_filter = None
             if filter_metadata:
                 sanitized_filter = self._sanitize_metadata(filter_metadata)
+                if not sanitized_filter:
+                    # Everything dropped (e.g. Swagger's {} placeholder) == no filter
+                    sanitized_filter = None
                 
             results = self.vector_store.similarity_search_with_score(
                 query=query,

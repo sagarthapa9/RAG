@@ -1,4 +1,4 @@
-# Simplified Development Dockerfile for Business RAG System with FastAPI & Azure LLM
+# Simplified Development Dockerfile for Business RAG System with FastAPI & provider-agnostic LLM
 FROM python:3.11-slim
 
 WORKDIR /app

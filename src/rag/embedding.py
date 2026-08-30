@@ -3,17 +3,44 @@ Updated EmbeddingGenerator with lazy loading and error handling
 """
 
 import logging
+from pathlib import Path
 from typing import List, Optional, Union
 import numpy as np
 import os
-os.environ['TRANSFORMERS_CACHE'] = '/app/cache/transformers'
-os.environ['HF_HOME'] = '/app/cache/huggingface'
-
-# Ensure these directories exist and are writable
-os.makedirs('/app/cache/transformers', exist_ok=True)
-os.makedirs('/app/cache/huggingface', exist_ok=True)
 
 logger = logging.getLogger(__name__)
+
+# Model cache directories.
+# Previously hardcoded to /app/cache/... which crashed on Windows at import time
+# (and hardcoded absolute paths break any non-Docker deployment). Now we:
+#   - respect an already-set env var (HF_HOME / TRANSFORMERS_CACHE), else
+#   - default to a project-local path under ./data/model_cache, and
+#   - create dirs defensively (fall back to a temp dir if unwritable).
+# Setup is deferred to EmbeddingGenerator.__init__ so importing this module
+# has no filesystem side effects.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_MODEL_CACHE = PROJECT_ROOT / "data" / "model_cache"
+
+
+def _resolve_cache_dir(subdir: str) -> str:
+    """Return a writable cache dir for `subdir`, preferring an existing env var."""
+    import tempfile
+
+    env_var = "HF_HOME" if subdir == "huggingface" else "TRANSFORMERS_CACHE"
+    if env_var in os.environ and os.environ[env_var]:
+        return os.environ[env_var]
+
+    for candidate in (
+        DEFAULT_MODEL_CACHE / subdir,
+        Path(tempfile.gettempdir()) / "rag_model_cache" / subdir,
+    ):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return str(candidate)
+        except OSError:
+            continue
+    # Last resort; model loading will fail loudly later rather than on import.
+    return str(DEFAULT_MODEL_CACHE / subdir)
 
 class EmbeddingGenerator:
     """
@@ -38,8 +65,15 @@ class EmbeddingGenerator:
         self._model = None
         self._model_loaded = False
         self._load_attempted = False
-        
+        self._configure_cache()
+
         logger.info(f"EmbeddingGenerator initialized with model: {model_name}")
+
+    @staticmethod
+    def _configure_cache() -> None:
+        """Point HF cache env vars at a writable local dir (no-op if already set)."""
+        os.environ.setdefault("TRANSFORMERS_CACHE", _resolve_cache_dir("transformers"))
+        os.environ.setdefault("HF_HOME", _resolve_cache_dir("huggingface"))
     
     def _load_model(self) -> bool:
         """

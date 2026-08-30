@@ -1,6 +1,9 @@
 """
-LLM-integrated RAG pipeline using LangChain + AzureChatOpenAI
-Works on top of the legacy Simple RAGPipeline (Chroma-backed).
+LLM-integrated RAG pipeline using LangChain + a configurable chat model.
+
+The LLM provider is chosen via the ``LLM_PROVIDER`` env var (default: ``kimi``);
+see ``LLMConfig`` / ``PROVIDERS`` for the supported set. Works on top of the
+legacy Simple RAGPipeline (Chroma-backed).
 """
 
 from __future__ import annotations
@@ -10,8 +13,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import os
 import logging
 
-from rag.pipeline import RAGPipeline  # your legacy class from the snippet
-from langchain_openai import AzureChatOpenAI
+from rag.pipeline import RAGPipeline
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
+from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
 logger = logging.getLogger(__name__)
@@ -31,60 +35,185 @@ class RAGAnswer:
         return asdict(self)
 
 
-class AzureLLMConfig:
-    """Reads Azure OpenAI config from environment with sensible defaults."""
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Static defaults + env-var conventions for one LLM provider."""
+
+    key_envs: Tuple[str, ...] = ()
+    base_url: Optional[str] = None
+    model: Optional[str] = None
+    key_required: bool = True
+    required_env: Tuple[str, ...] = ()
+
+
+PROVIDERS: Dict[str, ProviderSpec] = {
+    # Generic OpenAI — base URL / model are overridable via LLM_BASE_URL / LLM_MODEL.
+    "openai": ProviderSpec(
+        key_envs=("OPENAI_API_KEY",),
+        base_url="https://api.openai.com/v1",
+        model="gpt-4o-mini",
+    ),
+    # Kimi / Moonshot AI — OpenAI-compatible. China endpoint by default;
+    # use https://api.moonshot.ai/v1 for the international platform.
+    "kimi": ProviderSpec(
+        key_envs=("KIMI_API_KEY",),
+        base_url="https://api.moonshot.cn/v1",
+        model="moonshot-v1-8k",
+    ),
+    "deepseek": ProviderSpec(
+        key_envs=("DEEPSEEK_API_KEY",),
+        base_url="https://api.deepseek.com/v1",
+        model="deepseek-chat",
+    ),
+    # Local models served by Ollama's OpenAI-compatible endpoint (no key needed).
+    "ollama": ProviderSpec(
+        key_envs=("OLLAMA_API_KEY",),
+        base_url="http://localhost:11434/v1",
+        model="llama3.1",
+        key_required=False,
+    ),
+    # Azure OpenAI — built with AzureChatOpenAI (endpoint + deployment required).
+    "azure": ProviderSpec(
+        key_envs=("AZURE_OPENAI_API_KEY",),
+        model="gpt-4o-mini",
+        required_env=("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT"),
+    ),
+    # Any other OpenAI-compatible service: set LLM_API_KEY / LLM_BASE_URL / LLM_MODEL.
+    "custom": ProviderSpec(
+        key_envs=("LLM_API_KEY",),
+    ),
+}
+
+
+def _first_set(*env_names: str) -> Optional[str]:
+    """Return the value of the first environment variable that is set (or None)."""
+    for name in env_names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
+class LLMConfig:
+    """
+    Provider-agnostic LLM configuration read from the environment.
+
+    The provider is selected by ``LLM_PROVIDER`` (default ``kimi``, to stay
+    compatible with existing setups). Each provider has its own env vars (see
+    ``PROVIDERS``) but also honors the generic ``LLM_API_KEY`` /
+    ``LLM_BASE_URL`` / ``LLM_MODEL`` overrides, so switching providers usually
+    means just changing ``LLM_PROVIDER`` (and adding that provider's key).
+
+    Supported providers: openai, kimi, deepseek, ollama, azure, custom.
+    """
+
+    DEFAULT_PROVIDER = "kimi"
+
     def __init__(
         self,
         *,
+        provider: Optional[str] = None,
         api_key: Optional[str] = None,
-        azure_endpoint: Optional[str] = None,
-        deployment: Optional[str] = None,
-        api_version: Optional[str] = None,
-        temperature: float = 0.0,
-        max_tokens: int = 1024,
+        base_url: Optional[str] = None,
         model: Optional[str] = None,
+        temperature: float = 0.1,
+        max_tokens: int = 1024,
     ):
-        self.api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        self.azure_endpoint = azure_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT") or os.getenv("OPENAI_AZURE_ENDPOINT")
-        self.deployment = deployment or os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("OPENAI_AZURE_DEPLOYMENT")
-        self.api_version = api_version or os.getenv("AZURE_OPENAI_API_VERSION") or os.getenv("OPENAI_API_VERSION", "2024-02-01")
+        self.provider = (
+            provider or os.getenv("LLM_PROVIDER") or self.DEFAULT_PROVIDER
+        ).lower().strip()
+        if self.provider not in PROVIDERS:
+            raise ValueError(
+                f"Unknown LLM_PROVIDER={self.provider!r}. Valid options: "
+                f"{', '.join(sorted(PROVIDERS))}."
+            )
+        spec = PROVIDERS[self.provider]
         self.temperature = float(os.getenv("LLM_TEMPERATURE", str(temperature)))
         self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", str(max_tokens)))
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-        if not (self.api_key and self.azure_endpoint and self.deployment):
-            missing = [k for k, v in {
-                "AZURE_OPENAI_API_KEY": self.api_key,
-                "AZURE_OPENAI_ENDPOINT": self.azure_endpoint,
-                "AZURE_OPENAI_DEPLOYMENT": self.deployment,
-            }.items() if not v]
+        # API key: explicit arg > provider-specific env > generic LLM_API_KEY.
+        self.api_key = api_key or _first_set(*spec.key_envs, "LLM_API_KEY")
+        if spec.key_required and not self.api_key:
             raise ValueError(
-                f"Azure OpenAI configuration incomplete. Missing: {', '.join(missing)}"
+                f"LLM_PROVIDER={self.provider!r} needs an API key. Set "
+                f"{' or '.join(spec.key_envs)} (or the generic LLM_API_KEY) "
+                f"in your .env (see .env.example)."
             )
+
+        if self.provider == "azure":
+            # Azure stores the endpoint/deployment separately from the model.
+            self.base_url = os.getenv("AZURE_OPENAI_ENDPOINT") or base_url
+            self.deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+            self.api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
+            self.model = model or os.getenv("LLM_MODEL") or self.deployment or spec.model
+            missing = [name for name in spec.required_env if not os.getenv(name)]
+            if missing:
+                raise ValueError(
+                    f"LLM_PROVIDER=azure needs {', '.join(missing)} in your .env "
+                    f"(see .env.example)."
+                )
+        else:
+            # OpenAI-compatible providers: provider-specific env > generic > default.
+            self.base_url = (
+                base_url
+                or _first_set(f"{self.provider.upper()}_BASE_URL", "LLM_BASE_URL")
+                or spec.base_url
+            )
+            self.model = (
+                model
+                or _first_set(f"{self.provider.upper()}_MODEL", "LLM_MODEL")
+                or spec.model
+            )
+            self.deployment = None
+            self.api_version = None
+            if self.base_url is None:
+                raise ValueError(
+                    f"LLM_PROVIDER={self.provider!r} needs LLM_BASE_URL in your .env."
+                )
+            if self.model is None:
+                raise ValueError(
+                    f"LLM_PROVIDER={self.provider!r} needs LLM_MODEL in your .env."
+                )
+
+    def create_llm(self):
+        """Build the LangChain chat model for the configured provider."""
+        if self.provider == "azure":
+            return AzureChatOpenAI(
+                azure_endpoint=self.base_url,
+                api_key=self.api_key,
+                deployment_name=self.deployment,
+                api_version=self.api_version,
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+        return ChatOpenAI(
+            # Providers without keys (e.g. Ollama) use the standard "not-needed"
+            # placeholder accepted by OpenAI-compatible endpoints.
+            api_key=self.api_key or "not-needed",
+            base_url=self.base_url,
+            model=self.model,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+        )
 
 
 class LLMRAGPipeline:
     """
-    Composition: uses your Simple RAGPipeline for retrieval + AzureChatOpenAI for generation.
+    Composition: uses your Simple RAGPipeline for retrieval + a provider-agnostic
+    chat model (provider chosen via LLM_PROVIDER, default: Kimi / Moonshot AI) for
+    generation.
     """
 
     def __init__(
         self,
         retriever: Optional[RAGPipeline] = None,
-        llm_config: Optional[AzureLLMConfig] = None,
+        llm_config: Optional[LLMConfig] = None,
         system_prompt: Optional[str] = None,
     ):
         self.retriever = retriever or RAGPipeline()
-        self.llm_config = llm_config or AzureLLMConfig()
-        self.llm = AzureChatOpenAI(
-            azure_endpoint=self.llm_config.azure_endpoint,
-            api_key=self.llm_config.api_key,
-            deployment_name=self.llm_config.deployment,
-            model=self.llm_config.model,  # harmless for Azure; primary is deployment_name
-            api_version=self.llm_config.api_version,
-            temperature=self.llm_config.temperature,
-            max_tokens=self.llm_config.max_tokens,
-        )
+        self.llm_config = llm_config or LLMConfig()
+        self.llm = self.llm_config.create_llm()
 
         # Simple, grounded system prompt
         self.system_prompt = system_prompt or (
@@ -98,7 +227,11 @@ class LLMRAGPipeline:
             ("human", "Question: {question}\n\nContext:\n{context}\n\nFormat your answer first, then list sources.")
         ])
 
-        logger.info("LLMRAGPipeline initialized (retriever = Simple RAG, LLM = AzureChatOpenAI)")
+        logger.info(
+            f"LLMRAGPipeline initialized (retriever = Simple RAG, LLM = "
+            f"provider={self.llm_config.provider}, model={self.llm_config.model}, "
+            f"base_url={self.llm_config.base_url})"
+        )
 
     # def _build_context_and_sources(
     #     self, hits: Sequence[Dict[str, Any]]
@@ -160,7 +293,7 @@ class LLMRAGPipeline:
         llm_overrides: Optional[Dict[str, Any]] = None,
     ) -> RAGAnswer:
         """
-        Retrieve top-k chunks and ask AzureChatOpenAI to answer with grounding.
+        Retrieve top-k chunks and ask the chat model to answer with grounding.
         """
         # 1) Retrieve
         hits = self.retriever.search(query, k=k, filter_metadata=filter_metadata) or []
@@ -192,5 +325,5 @@ class LLMRAGPipeline:
             prompt_tokens=usage.get("input_tokens"),
             completion_tokens=usage.get("output_tokens"),
             total_tokens=usage.get("total_tokens"),
-            model=getattr(resp, "model", None) or self.llm_config.deployment,
+            model=getattr(resp, "model", None) or self.llm_config.model,
         )
