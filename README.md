@@ -52,6 +52,7 @@ uvicorn api.main:app --reload --port 8001
 | POST | `/api/upload/single` | Upload a document (multipart), process immediately or in background |
 | POST | `/api/search` | Semantic search (retrieval only, no LLM) |
 | POST/GET | `/api/qa/ask` | Ask a question — retrieves chunks, LLM answers with sources |
+| POST | `/api/qa/ask/stream` | Ask a question via Server-Sent Events — `sources`, then `token` deltas, then `done` |
 | GET | `/api/qa/health` | Q&A pipeline health |
 | GET | `/api/upload/status` | Upload config + vector store status |
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import asyncio
 import os
 import logging
 
@@ -19,6 +20,26 @@ from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
 
 logger = logging.getLogger(__name__)
+
+
+def _chunk_text_delta(content: Any) -> str:
+    """Extract the text delta from an AIMessageChunk.content (str or list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+            else:  # ContentBlock-like object
+                text = getattr(block, "text", None)
+                if text:
+                    parts.append(text)
+        return "".join(parts)
+    return ""
 
 
 @dataclass
@@ -284,6 +305,28 @@ class LLMRAGPipeline:
             sources.append(source)
 
         return "\n\n".join(context_lines), sources
+    def build_messages(
+        self,
+        query: str,
+        *,
+        k: int = 5,
+        filter_metadata: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[List, List[Dict[str, Any]]]:
+        """
+        Retrieve top-k chunks and format the prompt. Returns (messages, sources).
+
+        Split out of answer() so the streaming endpoint can run retrieval before
+        the response starts (retrieval failures then surface as normal HTTP errors).
+        """
+        hits = self.retriever.search(query, k=k, filter_metadata=filter_metadata) or []
+        context, sources = self._build_context_and_sources(hits)
+        messages = self.prompt.format_messages(
+            system_prompt=self.system_prompt,
+            question=query,
+            context=context if context.strip() else "(no relevant context retrieved)",
+        )
+        return messages, sources
+
     def answer(
         self,
         query: str,
@@ -295,23 +338,15 @@ class LLMRAGPipeline:
         """
         Retrieve top-k chunks and ask the chat model to answer with grounding.
         """
-        # 1) Retrieve
-        hits = self.retriever.search(query, k=k, filter_metadata=filter_metadata) or []
-        context, sources = self._build_context_and_sources(hits)
+        # 1) Retrieve + prepare prompt (shared with the streaming path)
+        messages, sources = self.build_messages(query, k=k, filter_metadata=filter_metadata)
 
-        # 2) Prepare prompt
-        messages = self.prompt.format_messages(
-            system_prompt=self.system_prompt,
-            question=query,
-            context=context if context.strip() else "(no relevant context retrieved)"
-        )
-
-        # 3) Optional LLM param overrides (temperature, max_tokens, etc.)
+        # 2) Optional LLM param overrides (temperature, max_tokens, etc.)
         llm = self.llm
         if llm_overrides:
             llm = llm.bind(**llm_overrides)
 
-        # 4) Invoke
+        # 3) Invoke
         resp = llm.invoke(messages)
 
         # 5) Usage & metadata (best-effort; depends on provider returning these fields)
@@ -327,3 +362,57 @@ class LLMRAGPipeline:
             total_tokens=usage.get("total_tokens"),
             model=getattr(resp, "model", None) or self.llm_config.model,
         )
+
+    async def answer_stream(
+        self,
+        messages: List,
+        sources: List[Dict[str, Any]],
+        *,
+        llm_overrides: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Stream answer token deltas + usage from the LLM.
+
+        Yields (event, payload) pairs:
+          ("token", {"text": <delta>})  -- one per chunk
+          ("error", {"detail": ...})    -- mid-stream failure, then generator ends
+          ("done", {model, prompt_tokens, completion_tokens, total_tokens, sources_count})
+        The caller emits the leading "sources" event (sources come from build_messages()).
+        """
+        llm = self.llm
+        if llm_overrides:
+            llm = llm.bind(**llm_overrides)
+
+        usage: Optional[Dict[str, Any]] = None
+        model: Optional[str] = None
+
+        try:
+            # stream_usage=True is required for usage metadata on OpenAI-compatible
+            # providers with custom base URLs (self.stream_usage stays None there).
+            async for chunk in llm.astream(messages, stream_usage=True):
+                if model is None:
+                    model = (chunk.response_metadata or {}).get("model_name") or getattr(
+                        chunk, "model", None
+                    )
+                if getattr(chunk, "usage_metadata", None):
+                    usage = chunk.usage_metadata  # last non-None wins (final total)
+                text = _chunk_text_delta(getattr(chunk, "content", None))
+                if text:
+                    yield ("token", {"text": text})
+        except asyncio.CancelledError:
+            logger.info("LLM stream cancelled (client disconnected)")
+            raise
+        except Exception as e:
+            logger.error("LLM streaming error: %s", e)
+            yield ("error", {"detail": f"Answer streaming failed: {str(e)}"})
+            return
+        finally:
+            logger.info("Stream finished for %d sources", len(sources))
+
+        yield ("done", {
+            "model": model or self.llm_config.model,
+            "prompt_tokens": (usage or {}).get("input_tokens"),
+            "completion_tokens": (usage or {}).get("output_tokens"),
+            "total_tokens": (usage or {}).get("total_tokens"),
+            "sources_count": len(sources),
+        })

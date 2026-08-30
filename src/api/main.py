@@ -6,7 +6,7 @@ import shutil
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTasks, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import logging
 from datetime import datetime
@@ -87,7 +87,12 @@ class QuestionResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
     metadata: Dict[str, Any]
-    
+
+
+def _sse(event: str, data: Any) -> str:
+    """Format one SSE event block. data must be JSON-serializable."""
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -434,8 +439,54 @@ async def ask_question_get(
         temperature=temperature,
         max_tokens=max_tokens
     )
-    
+
     return await ask_question(request)
+
+
+@app.post("/api/qa/ask/stream", response_model=None)
+async def ask_question_stream(request: QuestionRequest):
+    """
+    Stream an answer via Server-Sent Events.
+
+    Emits `sources` (first), then repeated `token` deltas, then `done` with usage
+    metadata, or `error` if generation fails mid-stream. Same body as /api/qa/ask.
+    """
+    llm_rag = get_llm_rag_pipeline()  # 503 before streaming if unavailable
+
+    llm_overrides = {}
+    if request.temperature is not None:
+        llm_overrides['temperature'] = request.temperature
+    if request.max_tokens is not None:
+        llm_overrides['max_tokens'] = request.max_tokens
+
+    logger.info(
+        "Q&A stream request: question=%r k=%s filter_metadata=%r temperature=%s max_tokens=%s",
+        request.question, request.k, request.filter_metadata,
+        request.temperature, request.max_tokens,
+    )
+
+    # Retrieval + prompt building happen HERE (sync, ~ms) so failures return a
+    # normal JSON HTTPException before streaming.
+    try:
+        messages, sources = llm_rag.build_messages(
+            request.question, k=request.k, filter_metadata=request.filter_metadata
+        )
+    except Exception as e:
+        logger.error("Retrieval failed for stream request '%s': %s", request.question, e)
+        raise HTTPException(status_code=500, detail=f"Retrieval failed: {str(e)}")
+
+    async def event_gen():
+        yield _sse("sources", {"question": request.question, "sources": sources})
+        async for event, payload in llm_rag.answer_stream(
+            messages, sources, llm_overrides=llm_overrides or None
+        ):
+            yield _sse(event, payload)
+
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/search")
