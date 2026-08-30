@@ -229,7 +229,143 @@ class ChromaVectorStore:
             documents.append(Document(page_content=text, metadata=metadata))
         
         return self.add_documents(documents)
-    
+
+    def _query_collection(
+        self,
+        query_embedding_list: List[float],
+        k: int,
+        filter: Optional[Dict],
+        query: str,
+    ) -> Dict:
+        """
+        Run the ChromaDB query, hardened against two known failure modes:
+
+        1. Cold-start: a filter-less query that returns 0 on a non-empty
+           collection (HNSW index not loaded yet) — retry once.
+        2. Index/metadata desync: e.g. after a force-kill, or when a second
+           process writes to the same PersistentClient store while this one is
+           open. A *filtered* query can then throw Chroma's internal
+           "Error finding id" (the metadata index knows the ids, the vector
+           index does not). Unfiltered queries still work, so fall back to
+           pulling extra candidates and applying the filter in Python.
+        """
+        try:
+            results = self.collection.query(
+                query_embeddings=[query_embedding_list],
+                n_results=k,
+                where=filter,
+            )
+        except Exception as e:
+            if not filter:
+                # A real failure (nothing to fall back to) — let the caller
+                # log the full traceback.
+                raise
+            logger.warning(
+                "ChromaDB query with metadata filter failed (%s); "
+                "falling back to client-side filtering", e,
+            )
+            return self._client_side_filtered_query(query_embedding_list, k, filter)
+
+        # An empty result needs a reason. With no filter, an empty result on
+        # a non-empty collection means the HNSW index wasn't loaded yet (any
+        # query gets top-k); retry once. With a filter, 0 hits usually means
+        # the filter matched nothing — log it so it's never a silent mystery.
+        if not (results['documents'] and results['documents'][0]):
+            logger.warning(
+                "Similarity search returned 0 hits: query=%r k=%s where=%r (collection count=%d)",
+                query, k, filter, self.collection.count(),
+            )
+            if not filter and self.collection.count() > 0:
+                logger.warning("Cold-start: retrying once (index may not be loaded yet)")
+                results = self.collection.query(
+                    query_embeddings=[query_embedding_list],
+                    n_results=k,
+                    where=filter,
+                )
+        return results
+
+    def _client_side_filtered_query(
+        self, query_embedding_list: List[float], k: int, filter: Dict,
+    ) -> Dict:
+        """Query unfiltered (more candidates) and apply the filter in Python."""
+        total = self.collection.count()
+        candidates = min(max(k * 10, k + 50), total) if total else k
+        results = self.collection.query(
+            query_embeddings=[query_embedding_list],
+            n_results=candidates,
+            where=None,
+        )
+        docs = results["documents"][0]
+        metas = results["metadatas"][0]
+        dists = results["distances"][0]
+        ids = results["ids"][0]
+
+        kept = [
+            (d, m, dist, cid)
+            for d, m, dist, cid in zip(docs, metas, dists, ids)
+            if self._metadata_matches(m, filter)
+        ]
+        kept.sort(key=lambda t: t[2])  # ascending distance == best first
+        kept = kept[:k]
+        return {
+            "documents": [[t[0] for t in kept]],
+            "metadatas": [[t[1] for t in kept]],
+            "distances": [[t[2] for t in kept]],
+            "ids": [[t[3] for t in kept]],
+        }
+
+    @staticmethod
+    def _metadata_matches(metadata: Dict, where: Dict) -> bool:
+        """Client-side reimplementation of ChromaDB's where-clause semantics."""
+        for key, cond in where.items():
+            if key == "$and":
+                if not all(ChromaVectorStore._metadata_matches(metadata, c) for c in cond):
+                    return False
+                continue
+            if key == "$or":
+                if not any(ChromaVectorStore._metadata_matches(metadata, c) for c in cond):
+                    return False
+                continue
+            if key == "$not":
+                if ChromaVectorStore._metadata_matches(metadata, cond):
+                    return False
+                continue
+
+            value = metadata.get(key)
+            if isinstance(cond, dict):
+                for op, target in cond.items():
+                    if not ChromaVectorStore._match_operator(value, op, target):
+                        return False
+            else:
+                if value != cond:
+                    return False
+        return True
+
+    @staticmethod
+    def _match_operator(value: Any, op: str, target: Any) -> bool:
+        if op == "$eq":
+            return value == target
+        if op == "$ne":
+            return value != target
+        if op == "$gt":
+            return value is not None and value > target
+        if op == "$gte":
+            return value is not None and value >= target
+        if op == "$lt":
+            return value is not None and value < target
+        if op == "$lte":
+            return value is not None and value <= target
+        if op == "$in":
+            return value in target
+        if op == "$nin":
+            return value not in target
+        if op == "$contains":
+            return isinstance(value, str) and target in value
+        if op == "$not_contains":
+            return not (isinstance(value, str) and target in value)
+        # Unknown operator — be strict so we never silently over-return.
+        return False
+
     def similarity_search(
         self,
         query: str,
@@ -253,29 +389,9 @@ class ChromaVectorStore:
             query_embedding = self.embedding_model.encode([query], convert_to_tensor=False)
             query_embedding_list = query_embedding.tolist()[0]
             
-            # Search in collection
-            results = self.collection.query(
-                query_embeddings=[query_embedding_list],
-                n_results=k,
-                where=filter
-            )
-
-            # An empty result needs a reason. With no filter, an empty result on
-            # a non-empty collection means the HNSW index wasn't loaded yet (any
-            # query gets top-k); retry once. With a filter, 0 hits usually means
-            # the filter matched nothing — log it so it's never a silent mystery.
-            if not (results['documents'] and results['documents'][0]):
-                logger.warning(
-                    "Similarity search returned 0 hits: query=%r k=%s where=%r (collection count=%d)",
-                    query, k, filter, self.collection.count()
-                )
-                if not filter and self.collection.count() > 0:
-                    logger.warning("Cold-start: retrying once (index may not be loaded yet)")
-                    results = self.collection.query(
-                        query_embeddings=[query_embedding_list],
-                        n_results=k,
-                        where=filter
-                    )
+            # Search in collection (cold-start retry + client-side-filter
+            # fallback for desynced stores live in _query_collection)
+            results = self._query_collection(query_embedding_list, k, filter, query)
             
             # Convert results to Document objects
             documents = []
@@ -322,29 +438,9 @@ class ChromaVectorStore:
             query_embedding = self.embedding_model.encode([query], convert_to_tensor=False)
             query_embedding_list = query_embedding.tolist()[0]
             
-            # Search in collection
-            results = self.collection.query(
-                query_embeddings=[query_embedding_list],
-                n_results=k,
-                where=filter
-            )
-
-            # An empty result needs a reason. With no filter, an empty result on
-            # a non-empty collection means the HNSW index wasn't loaded yet (any
-            # query gets top-k); retry once. With a filter, 0 hits usually means
-            # the filter matched nothing — log it so it's never a silent mystery.
-            if not (results['documents'] and results['documents'][0]):
-                logger.warning(
-                    "Similarity search returned 0 hits: query=%r k=%s where=%r (collection count=%d)",
-                    query, k, filter, self.collection.count()
-                )
-                if not filter and self.collection.count() > 0:
-                    logger.warning("Cold-start: retrying once (index may not be loaded yet)")
-                    results = self.collection.query(
-                        query_embeddings=[query_embedding_list],
-                        n_results=k,
-                        where=filter
-                    )
+            # Search in collection (cold-start retry + client-side-filter
+            # fallback for desynced stores live in _query_collection)
+            results = self._query_collection(query_embedding_list, k, filter, query)
             
             # Convert results to Document objects with scores
             documents_with_scores = []
