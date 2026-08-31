@@ -159,10 +159,13 @@ def setup_environment():
         except Exception as e:
             logger.warning(f"Could not create directory {directory}: {e}")
     
-    # Set environment variables for model caching
-    cache_dir = os.path.join("./data", "model_cache")
+    # Set environment variables for model caching. Derive the cache dir from the
+    # same VECTOR_STORE_PATH the store uses, so the model cache lives at
+    # <persist_dir>/model_cache — the location vector_store.py defaults to.
+    persist_dir = os.getenv("VECTOR_STORE_PATH", str(PROJECT_ROOT / "data" / "chromadb"))
+    cache_dir = os.path.join(persist_dir, "model_cache")
     os.makedirs(cache_dir, exist_ok=True, mode=0o755)
-    
+
     os.environ.setdefault('TRANSFORMERS_CACHE', cache_dir)
     os.environ.setdefault('HF_HOME', cache_dir)
     
