@@ -10,7 +10,6 @@ The full RAG pipeline is in place, end to end:
 |---|---|---|
 | Read | `DocumentReader` (PDF/DOCX/TXT + metadata) | `src/rag/document_reader.py` |
 | Chunk | `DocumentChunker` (recursive / fixed, tiktoken) | `src/rag/chunking.py` |
-| Embed | `EmbeddingGenerator` (sentence-transformers) | `src/rag/embedding.py` |
 | Store | `ChromaVectorStore` (LangChain `VectorStore`, cosine) | `src/rag/vector_store.py` |
 | Retrieve | `RAGPipeline.search()` → `Document` objects | `src/rag/pipeline.py` |
 | Generate | `LLMRAGPipeline` (provider-agnostic LLM — OpenAI-compatible, Azure, or local, grounded answers) | `src/rag/llm_rag.py` |

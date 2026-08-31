@@ -94,17 +94,30 @@ class ChromaVectorStore:
         
         # Initialize embedding model
         try:
-            # Set cache directories with proper permissions for HuggingFace models
-            cache_dir = os.path.join(persist_directory, "model_cache")
-            os.makedirs(cache_dir, exist_ok=True, mode=0o755)
-            
-            # Set environment variables for HuggingFace cache
-            os.environ['TRANSFORMERS_CACHE'] = cache_dir
-            os.environ['HF_HOME'] = cache_dir
-            
+            # Set cache directories with proper permissions for HuggingFace models.
+            # Respect a user-configured HF_HOME / TRANSFORMERS_CACHE; otherwise
+            # keep a cache inside the persist directory so the store stays
+            # self-contained (weights travel with the data dir). Falls back to a
+            # temp dir if the default is unwritable.
+            cache_dir = os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE")
+            if not cache_dir:
+                candidate = os.path.join(persist_directory, "model_cache")
+                try:
+                    os.makedirs(candidate, exist_ok=True, mode=0o755)
+                    cache_dir = candidate
+                except OSError:
+                    import tempfile
+                    cache_dir = os.path.join(tempfile.gettempdir(), "rag_model_cache")
+                    os.makedirs(cache_dir, exist_ok=True, mode=0o755)
+                    logger.warning(f"Using temp model cache dir: {cache_dir}")
+
+            # Don't clobber env vars the user may already have set (setdefault).
+            os.environ.setdefault('TRANSFORMERS_CACHE', cache_dir)
+            os.environ.setdefault('HF_HOME', cache_dir)
+
             self.embedding_model = SentenceTransformer(embedding_model, cache_folder=cache_dir)
             logger.info(f"Loaded embedding model: {embedding_model}")
-            
+
         except Exception as e:
             logger.error(f"Failed to load embedding model: {str(e)}")
             raise

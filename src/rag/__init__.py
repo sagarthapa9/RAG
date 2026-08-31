@@ -11,7 +11,6 @@ __author__ = "Business RAG Team"
 # Main exports
 from .document_reader import DocumentReader
 from .chunking import DocumentChunker, TextChunk
-from .embedding import EmbeddingGenerator
 from .vector_store import (
     ChromaVectorStore,
 
@@ -19,8 +18,7 @@ from .vector_store import (
 
 __all__ = [
     "DocumentReader",
-    "DocumentChunker", 
+    "DocumentChunker",
     "TextChunk",
-    "EmbeddingGenerator",
     "ChromaVectorStore"
 ]

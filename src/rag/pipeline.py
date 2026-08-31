@@ -232,34 +232,6 @@ class RAGPipeline:
         
         return len(all_documents)
     
-    def add_texts(
-        self,
-        texts: List[str],
-        metadatas: Optional[List[Dict[str, Any]]] = None
-    ) -> List[str]:
-        """
-        Add raw texts to the vector store.
-        
-        Args:
-            texts: List of text strings
-            metadatas: Optional list of metadata dictionaries
-            
-        Returns:
-            List of document IDs
-        """
-        try:
-            # Sanitize metadatas if provided
-            sanitized_metadatas = None
-            if metadatas:
-                sanitized_metadatas = [
-                    self._sanitize_metadata(metadata) for metadata in metadatas
-                ]
-            
-            return self.vector_store.add_texts(texts, sanitized_metadatas)
-        except Exception as e:
-            logger.error(f"Error adding texts to vector store: {e}")
-            raise
-    
     def search(
         self,
         query: str,
