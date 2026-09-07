@@ -18,6 +18,13 @@ services:
     environment:
       - PYTHONPATH=/app/src
       - PYTHONUNBUFFERED=1
+      # Model cache: point HuggingFace at the persist-dir cache (mounted from
+      # ./data/chromadb/model_cache on the host) so the container reuses the
+      # already-downloaded embedding weights instead of the image's ephemeral
+      # /app/models (which is re-downloaded by every fresh container). These
+      # override the Dockerfile's ENV; vector_store.py's setdefault honors them.
+      - HF_HOME=/app/data/chromadb/model_cache
+      - TRANSFORMERS_CACHE=/app/data/chromadb/model_cache
       # Vector DB settings (ChromaDB)
       - CHROMA_SERVER_HOST=chromadb
       - CHROMA_SERVER_HTTP_PORT=8000
@@ -46,7 +53,11 @@ services:
     image: chromadb/chroma:latest
     container_name: business-rag-chromadb
     ports:
-      - "8000:8000"
+      # Host port is 8010, not 8000: the unrelated wealthwise-v2 stack already
+      # binds 127.0.0.1:8000. The RAG code never calls this server (embedded
+      # PersistentClient), so the mapping is only for the Chroma web UI.
+      # Bound to 127.0.0.1 because this server currently has no auth (see below).
+      - "127.0.0.1:8010:8000"
     volumes:
       - chromadb_data:/chroma/chroma
     environment:
