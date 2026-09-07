@@ -6,6 +6,7 @@ For the flexible version, use RAGPipeline from vector_store.py
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
 import logging
+import os
 from  langchain_core.documents import Document
 
 from  rag.document_reader import DocumentReader
@@ -22,7 +23,7 @@ class RAGPipeline:
     
     def __init__(
         self,
-        chunk_size: int = 512,
+        chunk_size: int = 200,
         chunk_overlap: int = 50,
         embedding_model: str = "all-MiniLM-L6-v2",
         persist_directory: str = "./data/chromadb",
@@ -126,7 +127,27 @@ class RAGPipeline:
                 sanitized[key_str] = sanitized_value
         
         return sanitized
-    
+
+    @staticmethod
+    def _build_enrichment_prefix(metadata: Dict[str, Any]) -> str:
+        """Document-identity prefix baked into every chunk's stored + embedded text.
+
+        When a corpus holds many byte-similar documents (e.g. 521 Vanguard fund KIIDs
+        that differ only by fund name + charges %), the fund name must be IN the text
+        that gets embedded — metadata is invisible to cosine similarity. The filename
+        stem already carries the identity (title + ISIN), e.g.
+        "Vanguard Japan Stock Index Fund EUR Acc [IE0007286036].pdf" → the stem below.
+
+        Controlled by CHUNK_ENRICHMENT (default "true"); disable with "false" to ingest
+        arbitrary documents without a prefix. Requires re-ingest to take effect.
+        """
+        if os.getenv("CHUNK_ENRICHMENT", "true").strip().lower() not in ("1", "true", "yes", "on"):
+            return ""
+        name = metadata.get("filename") or metadata.get("file_path") or ""
+        if not name:
+            return ""
+        return f"{Path(name).stem} | "
+
     def process_documents(
         self,
         document_paths: List[Path],
@@ -159,7 +180,13 @@ class RAGPipeline:
                 # Merge and sanitize metadata
                 if metadata:
                     base_metadata.update(metadata)
-                
+
+                # Document-identity prefix baked into every chunk's text before it
+                # is embedded, so chunks of THIS doc can be told apart from the
+                # byte-similar chunks of other docs (e.g. 521 near-identical fund
+                # KIIDs) by pure vector similarity. Computed once per document.
+                enrich_prefix = self._build_enrichment_prefix(base_metadata)
+
                 chunks = self.chunker.chunk_document(
                     content, base_metadata, strategy=chunking_strategy
                 )
@@ -181,9 +208,12 @@ class RAGPipeline:
                         
                         # Sanitize metadata before creating Document
                         sanitized_metadata = self._sanitize_metadata(chunk_metadata)
-                        
+
+                        # Enriched text is both stored and embedded (vector_store
+                        # encodes page_content verbatim), so the fund identity
+                        # travels with every chunk.
                         doc = Document(
-                            page_content=chunk.content,
+                            page_content=f"{enrich_prefix}{chunk.content}",
                             metadata=sanitized_metadata
                         )
                     elif isinstance(chunk, dict):
@@ -377,10 +407,25 @@ class RAGPipeline:
             logger.error(f"Error getting document count: {e}")
             return 0
 
+    def list_chunks(self, limit: int = 20, offset: int = 0,
+                    include_embeddings: bool = True) -> Dict[str, Any]:
+        """Page over every stored chunk (id, text, metadata, embedding).
+
+        Thin wrapper over ChromaVectorStore.get_items so the API layer only talks
+        to the pipeline. Returns Chroma's get() dict — 'documents' holds the chunk
+        text, 'embeddings' is present only when include_embeddings is True.
+        """
+        try:
+            return self.vector_store.get_items(
+                limit=limit, offset=offset, include_embeddings=include_embeddings)
+        except Exception as e:
+            logger.error(f"Error listing chunks: {e}")
+            raise
+
 
 # Compatibility function for existing code
 def create_rag_pipeline(
-    chunk_size: int = 512,
+    chunk_size: int = 200,
     chunk_overlap: int = 50,
     embedding_model: str = "all-MiniLM-L6-v2",
     persist_directory: str = "./data/chromadb"

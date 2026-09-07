@@ -9,6 +9,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, Form, BackgroundTa
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import logging
+import threading
+import uuid
 from datetime import datetime
 import json
 from contextlib import asynccontextmanager
@@ -28,6 +30,11 @@ logger = logging.getLogger(__name__)
 # Global variables to store the RAG components
 retriever = None
 llm_rag_pipeline = None
+
+# In-memory registry of bulk-upload jobs (job_id -> job state). Lives only as
+# long as the process runs (lost on restart); guarded by _bulk_jobs_lock.
+bulk_jobs: Dict[str, Any] = {}
+_bulk_jobs_lock = threading.Lock()
 
 # Configuration
 # Paths are anchored to the project root (src/api/main.py -> parents[2]) so the
@@ -87,6 +94,64 @@ class QuestionResponse(BaseModel):
     answer: str
     sources: List[Dict[str, Any]]
     metadata: Dict[str, Any]
+
+class ClearVectorStoreRequest(BaseModel):
+    # Defaults to False so a missing field / {} is rejected by the handler with
+    # 400 (not pydantic's 422). Guarded: only {"confirm": true} passes.
+    confirm: bool = False
+
+class ClearVectorStoreResponse(BaseModel):
+    status: str          # "success"
+    message: str         # "Vector store cleared"
+    chunks_removed: int
+    remaining_chunks: int
+    timestamp: str
+
+class VectorStoreRow(BaseModel):
+    id: str
+    text: str
+    metadata: Dict[str, Any] = {}
+    embedding_length: int = 0
+    embedding: Optional[List[float]] = None   # populated only when include_embeddings=true
+
+class VectorStoreRowsResponse(BaseModel):
+    total_chunks: int
+    offset: int
+    limit: int
+    rows: List[VectorStoreRow]
+
+class BulkFileResult(BaseModel):
+    filename: str
+    status: str                # pending | success | failed | skipped
+    chunks_created: int = 0
+    error: Optional[str] = None
+
+class BulkUploadResponse(BaseModel):
+    job_id: str
+    status: str                # queued
+    files_accepted: int
+    files_rejected: int
+    message: str
+
+class FolderIngestRequest(BaseModel):
+    # Which server-side folder to scan. `folder` is resolved relative to the
+    # project root unless absolute (it must still resolve inside the project).
+    # All fields optional so a bare `POST /api/ingest/folder` ingests documents/.
+    folder: str = "documents"
+    recursive: bool = True
+    chunking_strategy: str = "recursive"
+
+class BulkJobResponse(BaseModel):
+    job_id: str
+    status: str                # queued | running | completed
+    total_files: int
+    succeeded: int
+    failed: int
+    skipped: int
+    total_chunks: int
+    files: List[BulkFileResult]
+    created_at: str
+    finished_at: Optional[str] = None
 
 
 def _sse(event: str, data: Any) -> str:
@@ -178,7 +243,7 @@ def initialize_rag_pipeline() -> RAGPipeline:
     try:
         # RAG pipeline configuration
         rag_config = {
-            "chunk_size": int(os.getenv("CHUNK_SIZE", "512")),
+            "chunk_size": int(os.getenv("CHUNK_SIZE", "200")),
             "chunk_overlap": int(os.getenv("CHUNK_OVERLAP", "50")),
             "embedding_model": os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
             "persist_directory": os.getenv("VECTOR_STORE_PATH", str(PROJECT_ROOT / "data" / "chromadb")),
@@ -201,7 +266,7 @@ def initialize_rag_pipeline() -> RAGPipeline:
             logger.info("Attempting fallback RAG pipeline initialization...")
             
             fallback_config = {
-                "chunk_size": 512,
+                "chunk_size": 200,
                 "chunk_overlap": 50,
                 "embedding_model": "all-MiniLM-L6-v2",
                 "persist_directory": os.path.join(os.path.expanduser("~"), ".rag_data"),
@@ -614,9 +679,12 @@ def validate_file(file: UploadFile) -> bool:
 async def save_uploaded_file(file: UploadFile) -> Path:
     """Save uploaded file to disk and return the path"""
     
-    # Generate unique filename
+    # Generate a unique filename. The random token guards against two uploads
+    # sharing the same second and the same original name — a bulk request with
+    # duplicate filenames would otherwise silently overwrite the first file.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    safe_filename = f"{timestamp}_{file.filename}"
+    token = uuid.uuid4().hex[:8]
+    safe_filename = f"{timestamp}_{token}_{file.filename}"
     file_path = Path(UPLOAD_DIRECTORY) / safe_filename
     
     # Save file with size checking
@@ -746,3 +814,412 @@ async def qa_health_check():
             "llm_pipeline": "error",
             "error": str(e)
         }
+
+
+# --- Vector store admin ---
+def _check_clear_guard(request: ClearVectorStoreRequest) -> None:
+    """Guard against accidental wipes: a stray Swagger click (empty body or {})
+    must never empty the store. Only an explicit {"confirm": true} passes."""
+    if request.confirm is not True:
+        raise HTTPException(
+            status_code=400,
+            detail='Clearing the vector store requires body {"confirm": true}',
+        )
+
+
+@app.post("/api/vector-store/clear", response_model=ClearVectorStoreResponse)
+async def clear_vector_store(request: ClearVectorStoreRequest):
+    """Empty the Chroma collection (chunk text + metadata + embedding vectors).
+
+    Clear-only: does NOT delete data/chromadb files (model_cache survives),
+    does NOT touch data/uploads, and does NOT re-ingest.
+    """
+    pipeline = get_rag_pipeline()      # 503 if RAG pipeline is not initialized
+    _check_clear_guard(request)        # 400 unless confirm == true
+
+    try:
+        before = pipeline.get_document_count()
+        ok = pipeline.clear_vector_store()
+        after = pipeline.get_document_count()
+
+        if not ok:
+            raise HTTPException(status_code=500, detail="Vector store clear failed")
+        if after != 0:
+            logger.error("Vector store clear left %d chunks behind", after)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Vector store not empty after clear ({after} chunks remain)",
+            )
+
+        logger.info("Vector store cleared: removed %d chunks, %d remaining",
+                    before - after, after)
+        return ClearVectorStoreResponse(
+            status="success",
+            message="Vector store cleared",
+            chunks_removed=before - after,
+            remaining_chunks=after,
+            timestamp=datetime.utcnow().isoformat(),
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Error clearing vector store: %s", e)
+        raise HTTPException(status_code=500, detail=f"Vector store clear failed: {e}")
+
+
+@app.get("/api/vector-store/rows", response_model=VectorStoreRowsResponse)
+async def list_vector_store_rows(
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=200),
+    include_embeddings: bool = Query(False),
+):
+    """Page over the stored chunks — the vector-store equivalent of SELECT *.
+
+    Every collection entry is a chunk: an id, the chunk text, its metadata, and
+    its embedding vector. Returns rows in store order, paginated with
+    limit/offset; pass include_embeddings=true to fetch the full float vector
+    (dimension is always reported via embedding_length).
+    """
+    pipeline = get_rag_pipeline()      # 503 if RAG pipeline is not initialized
+    try:
+        data = pipeline.list_chunks(
+            limit=limit, offset=offset, include_embeddings=include_embeddings)
+        total = pipeline.get_document_count()
+    except Exception as e:
+        logger.error("Error reading vector store rows: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to read vector store: {e}")
+
+    ids = data.get("ids") or []
+    documents = data.get("documents") or []
+    metadatas = data.get("metadatas") or []
+    # Chroma returns embeddings as a NumPy array, never use `or []` on it (a
+    # truth-test on a multi-element array raises "truth value is ambiguous").
+    raw_embeddings = data.get("embeddings")
+    embeddings = raw_embeddings if raw_embeddings is not None else []
+
+    rows = []
+    for i, chunk_id in enumerate(ids):
+        text = documents[i] if i < len(documents) and documents[i] else ""
+        meta = metadatas[i] if i < len(metadatas) and metadatas[i] else {}
+        emb = embeddings[i] if i < len(embeddings) else None
+        emb_list = None
+        if emb is not None:
+            # Normalize numpy row -> plain Python list of floats for pydantic.
+            emb_list = emb.tolist() if hasattr(emb, "tolist") else list(emb)
+        rows.append(VectorStoreRow(
+            id=chunk_id,
+            text=text,
+            metadata=meta,
+            embedding_length=len(emb_list) if emb_list is not None else 0,
+            embedding=emb_list,
+        ))
+
+    return VectorStoreRowsResponse(
+        total_chunks=total,
+        offset=offset,
+        limit=limit,
+        rows=rows,
+    )
+
+
+# --- Bulk upload (many documents in one request) ---
+MAX_BULK_JOBS = 20
+
+
+def _run_bulk_job(job_id: str, rag_pipeline: RAGPipeline) -> None:
+    """Process one bulk-upload job in a background thread.
+
+    Each file goes through the existing read -> chunk -> embed -> add path as its
+    own process_documents() call, so a failure is isolated to that file (earlier
+    files stay stored) and peak memory is bounded to one file's chunks at a time.
+    """
+    with _bulk_jobs_lock:
+        job = bulk_jobs.get(job_id)
+        if job is None:
+            logger.error("Bulk job %s not found", job_id)
+            return
+        job["status"] = "running"
+        results = job["results"]
+        paths = job["paths"]
+        strategy = job["chunking_strategy"]
+
+    for result, path in zip(results, paths):
+        if path is None:
+            continue  # skipped during upload (validation / save failed)
+        filename = result["filename"]
+        try:
+            chunk_count = rag_pipeline.process_documents([path], strategy)
+        except Exception as e:
+            logger.error("Bulk job %s: failed to process %s: %s", job_id, filename, e)
+            with _bulk_jobs_lock:
+                result.update(status="failed", error=str(e))
+                job["failed"] += 1
+        else:
+            logger.info("Bulk job %s: processed %s (%d chunks)", job_id, filename, chunk_count)
+            with _bulk_jobs_lock:
+                result.update(status="success", chunks_created=chunk_count)
+                job["succeeded"] += 1
+                job["total_chunks"] += chunk_count
+
+    with _bulk_jobs_lock:
+        job["status"] = "completed"
+        job["finished_at"] = datetime.utcnow().isoformat()
+    logger.info("Bulk job %s completed: %d ok, %d failed, %d chunks total",
+                job_id, job["succeeded"], job["failed"], job["total_chunks"])
+
+
+@app.post("/api/upload/bulk", response_model=BulkUploadResponse)
+async def upload_bulk_documents(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(...),
+    chunking_strategy: str = Form("recursive"),
+):
+    """Upload many documents in one request.
+
+    Saves every file to disk immediately, then processes them one at a time in a
+    background thread (the request does not block on embedding). Returns a job_id
+    to poll via GET /api/upload/bulk/{job_id}. Files that fail validation or size
+    checks are reported as skipped and the rest still process.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    rag_pipeline = get_rag_pipeline()      # 503 if RAG pipeline is not initialized
+
+    results = []
+    paths = []
+    rejected = 0
+    for file in files:
+        filename = file.filename or "unnamed"
+        try:
+            validate_file(file)
+            path = await save_uploaded_file(file)
+        except HTTPException as e:
+            rejected += 1
+            results.append({
+                "filename": filename,
+                "status": "skipped",
+                "chunks_created": 0,
+                "error": e.detail,
+            })
+            paths.append(None)
+            continue
+        results.append({
+            "filename": filename,
+            "status": "pending",
+            "chunks_created": 0,
+            "error": None,
+        })
+        paths.append(path)
+
+    accepted = len(results) - rejected
+    if accepted == 0:
+        first_error = next((r["error"] for r in results if r["error"]), "unknown")
+        raise HTTPException(
+            status_code=400,
+            detail=f"No files could be accepted for processing. First error: {first_error}",
+        )
+
+    job_id = uuid.uuid4().hex[:12]
+    with _bulk_jobs_lock:
+        bulk_jobs[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "chunking_strategy": chunking_strategy,
+            "results": results,
+            "paths": paths,
+            "succeeded": 0,
+            "failed": 0,
+            "total_chunks": 0,
+            "created_at": datetime.utcnow().isoformat(),
+            "finished_at": None,
+        }
+        # Keep only the most recent jobs so the in-memory registry can't grow forever.
+        while len(bulk_jobs) > MAX_BULK_JOBS:
+            bulk_jobs.pop(next(iter(bulk_jobs)))
+
+    background_tasks.add_task(_run_bulk_job, job_id, rag_pipeline)
+    logger.info("Bulk upload queued: job=%s accepted=%d rejected=%d",
+                job_id, accepted, rejected)
+    return BulkUploadResponse(
+        job_id=job_id,
+        status="queued",
+        files_accepted=accepted,
+        files_rejected=rejected,
+        message=(
+            f"Bulk upload queued: {accepted} file(s) accepted, {rejected} rejected. "
+            f"Poll GET /api/upload/bulk/{job_id}"
+        ),
+    )
+
+
+# Both poll paths serve the same in-memory job registry: upload-bulk jobs and
+# folder-ingest jobs live together in `bulk_jobs`, so one handler backs both.
+@app.get("/api/upload/bulk/{job_id}", response_model=BulkJobResponse)
+@app.get("/api/ingest/jobs/{job_id}", response_model=BulkJobResponse)
+async def get_bulk_job_status(job_id: str):
+    """Return the current status of an ingest job (bulk upload or folder ingest)."""
+    with _bulk_jobs_lock:
+        job = bulk_jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Ingest job {job_id} not found")
+        # Snapshot under the lock so a concurrent worker can't leave a half-written row.
+        snapshot = {
+            "job_id": job["id"],
+            "status": job["status"],
+            "results": [dict(r) for r in job["results"]],
+            "succeeded": job["succeeded"],
+            "failed": job["failed"],
+            "total_chunks": job["total_chunks"],
+            "created_at": job["created_at"],
+            "finished_at": job["finished_at"],
+        }
+
+    return BulkJobResponse(
+        job_id=snapshot["job_id"],
+        status=snapshot["status"],
+        total_files=len(snapshot["results"]),
+        succeeded=snapshot["succeeded"],
+        failed=snapshot["failed"],
+        skipped=sum(1 for r in snapshot["results"] if r["status"] == "skipped"),
+        total_chunks=snapshot["total_chunks"],
+        files=[BulkFileResult(**r) for r in snapshot["results"]],
+        created_at=snapshot["created_at"],
+        finished_at=snapshot["finished_at"],
+    )
+
+
+# --- Folder ingest (documents already on the server, no HTTP upload) ---
+
+# Top-level project dirs that must never be scanned as "documents". data/ holds
+# the Chroma store + embedding model cache — those .json files are *not* source
+# documents and ingesting them would poison the store. uploads_data/ is the
+# upload spool (re-ingesting it would duplicate every uploaded file).
+_INGEST_FORBIDDEN_ROOTS = {"data", ".git", ".venv", "src", "tests", "uploads_data"}
+
+
+def _resolve_ingest_folder(folder: str) -> Path:
+    """Resolve a user-supplied folder to an absolute path we may scan.
+
+    Keeps reads confined to the project tree (in Docker that is /app — the only
+    host folders visible are the bind mounts, of which documents/ is the intended
+    one). Raises HTTPException(400) for anything outside it or that looks like an
+    internal directory.
+    """
+    raw = Path(folder).expanduser()
+    if not raw.is_absolute():
+        raw = PROJECT_ROOT / raw
+    try:
+        raw = raw.resolve()
+        rel = raw.relative_to(PROJECT_ROOT)
+    except (OSError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder must be inside the project root (got: {folder})",
+        )
+    if not raw.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Folder does not exist or is not a directory: {raw}",
+        )
+    if not rel.parts or rel.parts[0] in _INGEST_FORBIDDEN_ROOTS:
+        raise HTTPException(
+            status_code=400,
+            detail="Please point at a folder of source documents, e.g. 'documents' "
+                   f"(not '{raw.name}').",
+        )
+    return raw
+
+
+@app.post("/api/ingest/folder", response_model=BulkUploadResponse)
+async def ingest_folder(
+    background_tasks: BackgroundTasks,
+    request: FolderIngestRequest = FolderIngestRequest(),
+):
+    """Scan a server-side folder and ingest every supported document in it.
+
+    Unlike the bulk-upload endpoint nothing is transferred over HTTP: files are
+    read straight off disk (e.g. the documents/ folder, which Docker bind-mounts
+    into the container). Registers the same background job as /api/upload/bulk
+    (files processed one at a time, per-file failure isolation) and is polled the
+    same way: GET /api/ingest/jobs/{job_id}.
+    """
+    rag_pipeline = get_rag_pipeline()      # 503 if RAG pipeline is not initialized
+    folder = _resolve_ingest_folder(request.folder)
+
+    iterator = folder.rglob("*") if request.recursive else folder.iterdir()
+    found = sorted(p for p in iterator if p.is_file())
+
+    results: List[Dict[str, Any]] = []
+    paths: List[Optional[Path]] = []
+    rejected = 0
+    for path in found:
+        display = str(path.relative_to(folder))     # keeps subfolder structure readable
+        if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+            rejected += 1
+            results.append({
+                "filename": display,
+                "status": "skipped",
+                "chunks_created": 0,
+                "error": (f"File type {path.suffix.lower() or '(none)'} not supported. "
+                          f"Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}"),
+            })
+            paths.append(None)
+            continue
+        if path.stat().st_size > MAX_FILE_SIZE:
+            rejected += 1
+            results.append({
+                "filename": display,
+                "status": "skipped",
+                "chunks_created": 0,
+                "error": f"File too large (> {MAX_FILE_SIZE // (1024 * 1024)}MB)",
+            })
+            paths.append(None)
+            continue
+        results.append({
+            "filename": display,
+            "status": "pending",
+            "chunks_created": 0,
+            "error": None,
+        })
+        paths.append(path)
+
+    accepted = len(results) - rejected
+    if accepted == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No supported documents found in {folder}. "
+                   f"Supported: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+
+    job_id = uuid.uuid4().hex[:12]
+    with _bulk_jobs_lock:
+        bulk_jobs[job_id] = {
+            "id": job_id,
+            "status": "queued",
+            "chunking_strategy": request.chunking_strategy,
+            "results": results,
+            "paths": paths,
+            "succeeded": 0,
+            "failed": 0,
+            "total_chunks": 0,
+            "created_at": datetime.utcnow().isoformat(),
+            "finished_at": None,
+        }
+        # Keep only the most recent jobs so the in-memory registry can't grow forever.
+        while len(bulk_jobs) > MAX_BULK_JOBS:
+            bulk_jobs.pop(next(iter(bulk_jobs)))
+
+    background_tasks.add_task(_run_bulk_job, job_id, rag_pipeline)
+    logger.info("Folder ingest queued: folder=%s job=%s accepted=%d skipped=%d",
+                folder, job_id, accepted, rejected)
+    return BulkUploadResponse(
+        job_id=job_id,
+        status="queued",
+        files_accepted=accepted,
+        files_rejected=rejected,
+        message=(
+            f"Folder ingest queued: {accepted} file(s) from {folder}, "
+            f"{rejected} skipped. Poll GET /api/ingest/jobs/{job_id}"
+        ),
+    )

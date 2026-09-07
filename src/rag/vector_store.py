@@ -9,6 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import chromadb
 from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
+import torch
 from pydantic import Field
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -115,8 +116,33 @@ class ChromaVectorStore:
             os.environ.setdefault('TRANSFORMERS_CACHE', cache_dir)
             os.environ.setdefault('HF_HOME', cache_dir)
 
-            self.embedding_model = SentenceTransformer(embedding_model, cache_folder=cache_dir)
-            logger.info(f"Loaded embedding model: {embedding_model}")
+            # Use the GPU when torch can see one (CUDA-enabled build + NVIDIA
+            # driver); otherwise fall back to CPU. SentenceTransformer would
+            # auto-select anyway, but explicit selection makes the choice
+            # deterministic and visible in the logs.
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            try:
+                self.embedding_model = SentenceTransformer(
+                    embedding_model, cache_folder=cache_dir, device=device
+                )
+            except Exception:
+                if device == "cuda":
+                    # A CUDA-enabled torch can still fail to load (driver
+                    # mismatch, init-time OOM) — degrade to CPU rather than crash.
+                    logger.warning(
+                        "CUDA load failed for %s; falling back to CPU",
+                        embedding_model, exc_info=True,
+                    )
+                    self.embedding_model = SentenceTransformer(
+                        embedding_model, cache_folder=cache_dir, device="cpu"
+                    )
+                    device = "cpu"
+                else:
+                    raise
+
+            backend = torch.cuda.get_device_name(0) if device == "cuda" else "cpu"
+            logger.info("Embedding model %s loaded on device=%s (%s)",
+                        embedding_model, device, backend)
 
         except Exception as e:
             logger.error(f"Failed to load embedding model: {str(e)}")
@@ -533,6 +559,25 @@ class ChromaVectorStore:
             logger.error(f"Error getting collection info: {str(e)}")
             return {"error": str(e)}
     
+    def get_items(self, limit: int = 20, offset: int = 0,
+                  include_embeddings: bool = True) -> Dict[str, Any]:
+        """Page over stored rows — the vector-store equivalent of `SELECT *`.
+
+        Thin wrapper around Chroma's collection.get(limit, offset) so the API
+        layer never touches the collection directly. Returns the raw get()
+        dict: {'ids': [...], 'documents': [chunk text ...], 'metadatas': [...],
+        and 'embeddings' when include_embeddings is True}. Rows come back in
+        store order; paginate with limit/offset.
+        """
+        include = ["documents", "metadatas"]
+        if include_embeddings:
+            include.append("embeddings")
+        try:
+            return self.collection.get(limit=limit, offset=offset, include=include)
+        except Exception as e:
+            logger.error(f"Error getting items from vector store: {str(e)}")
+            raise
+
     def clear_collection(self) -> bool:
         """Clear all documents from the collection"""
         try:
