@@ -277,6 +277,41 @@ For an exact code/figure that must be findable, there are three escalating optio
    added complexity (a second index + a fusion strategy), worth it only when queries genuinely
    mix "meaning questions" and "exact-code questions."
 
+### Is hybrid search required for this project? (short answer: no)
+
+The near-duplicate-funds miss was **not** a dense-vs-sparse gap — it was a *"the identifier is
+nowhere in the text"* gap. The fund name + ISIN lived only in metadata, so neither dense *nor*
+BM25 could have matched it, because neither retriever sees metadata. The real fix had to put the
+identifier into retrievable text — which is exactly what **chunk enrichment** (this codebase's
+`CHUNK_ENRICHMENT`, default on) now does. Adding a BM25 index on top of *that* would mostly
+duplicate what enrichment already makes the dense retriever capable of.
+
+Hybrid becomes the *ideal* choice when your queries have several of these properties:
+
+- **Exact-identifier queries** — the user types a code/ID that must match verbatim
+  (`IE0007286036`, part/reference numbers). Dense treats an ISIN as a fuzzy blob; BM25 matches
+  it character-for-character.
+- **Out-of-vocabulary domain terms** — rare proper nouns, internal acronyms, jargon the
+  embedding model never saw, so dense can't rank on them.
+- **Short keyword-style queries** — users type fragments ("Tesco 2024 revenue") rather than
+  full sentences.
+- **Guaranteed recall** — a document containing a specific term must never be missed
+  (compliance, exact-match), even when it ranks below dense's picks.
+- **Noisy / OCR-heavy or mixed-language text**, where dense quality degrades.
+
+For this codebase the cheaper levers, in order, cover the real failure modes before you pay for
+a second index:
+
+| Need | Tool | Cost |
+|---|---|---|
+| Exact ISIN/code queries | **Enrichment** already puts the code into embeddable text — an exact-code query now retrieves the right chunks by dense alone | already live |
+| Scope a question to one fund | **Auto-scope**: if the query contains a known ISIN/fund name, inject the metadata `filename` filter | small resolver, no re-index |
+| Full hybrid recall guarantees | BM25 inverted index + RRF/weighted fusion | second index, fusion tuning, more moving parts |
+
+So: skip hybrid for now. Add it only if the system later serves queries built around exact
+codes/IDs or a domain with heavy out-of-vocabulary jargon — that is a genuine addition, not a
+nicer way to do the same thing.
+
 ### What metadata is used for
 
 1. **Hard constraints similarity can't express (filtering / scoping).** The killer use case —
