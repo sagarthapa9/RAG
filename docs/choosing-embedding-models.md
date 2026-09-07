@@ -26,7 +26,7 @@ multilingual model.
 
 The embedding model's **context window** (`max_seq_length`) is the maximum number of tokens
 it can look at in a single pass. This is the most commonly overlooked criterion, and the one
-this project currently trips over.
+this project has already tripped over.
 
 #### What the context window actually controls
 
@@ -74,11 +74,11 @@ debugging the LLM, the provider, or the API key instead of the real cause.
 
 The model's `max_seq_length` must be **≥ your chunk's token count**.
 
-> ⚠️ This is the criterion the project currently trips over:
-> `DocumentChunker` makes **512-token** chunks (default `CHUNK_SIZE=512`), but the default
-> model `all-MiniLM-L6-v2` only reads **256 tokens**. Half of every chunk is being thrown
-> away at embedding time. `chunk_overlap` does not fix this — it only softens cuts at chunk
-> boundaries, not the model's fixed truncation point.
+> ⚠️ This is the criterion that bit this project: the chunker used to make **512-token**
+> chunks (default `CHUNK_SIZE=512`) while `all-MiniLM-L6-v2` only reads **256 tokens** — so
+> half of every chunk was silently discarded at embed time. The default is now
+> `CHUNK_SIZE=200`, sized to stay inside the model's window. `chunk_overlap` does not fix
+> truncation — it only softens cuts at chunk boundaries.
 
 | Model | Max context |
 |---|---|
@@ -142,6 +142,11 @@ evaluation on your own documents:
 This can be done with `RAGPipeline.search()` you already have — roughly 20 lines of script
 in `tests/`.
 
+> Before blaming the model, classify the miss: if the right chunk exists but fails to rank,
+> that may be a **hard-constraint** problem (right fund, wrong scope) rather than a semantic
+> one — which no embedding model fixes. That's the metadata side of retrieval; see
+> [Metadata: the half of retrieval an embedding model can't do](#metadata-the-half-of-retrieval-an-embedding-model-cant-do).
+
 ### 6. Instruction protocol
 
 Some models expect **queries** to be encoded differently from **documents**:
@@ -166,6 +171,170 @@ instruction-aware model needs its prompt wired in at the query call sites to rea
 
 ---
 
+## Metadata: the half of retrieval an embedding model can't do
+
+An embedding model is only the **similarity** half of retrieval. Every stored chunk has two
+parts, joined by its chunk `id`:
+
+- **The embedding** (384 floats for MiniLM) = the chunk's *meaning*, used for ranking. It can
+  only answer "which chunks *mean* the same as my query?"
+- **The metadata** (a dict of scalars: `filename`, `page`, `start_char`, `fund_isin`, …) =
+  the chunk's *facts and provenance*. It answers questions similarity physically cannot: "is
+  this chunk *from* this document?", "is this chunk *allowed* for this user?"
+
+Similarity is fuzzy; metadata is exact. A vector search has no idea that chunk #451 is the
+Vanguard Japan fund while chunk #1,234 is a different fund that happens to share
+byte-near-identical boilerplate. That exactness is why production RAG stores both, always.
+
+### How the two halves combine at search time
+
+A query goes through four steps, and each half is used at a different step:
+
+```
+Query: "What is the ongoing charges for the Japan fund?"
+        │
+        ▼
+ 1. Embed the query  ─────────────────────────────────►  query vector (384 floats)
+        │
+ 2. If a metadata filter is supplied (e.g. filename = "...IE0007286036.pdf"):
+        │
+        ▼
+    Chroma picks the candidate pool — only chunks whose metadata MATCHES ─┐
+        │                                                                │
+        ▼                                                                ▼
+ 3. Cosine similarity: query vector vs. the EMBEDDINGS of those chunks
+        │
+        ▼
+ 4. Return top-k of that pool, ranked by similarity
+```
+
+| Step | Uses | Decides |
+|---|---|---|
+| **Filter (`where`)** | **metadata** | who's *allowed* in the pool — inclusion/exclusion, no score |
+| **Similarity (ranking)** | **embeddings** | order *within* the pool — the scores |
+
+So the two halves meet at the chunk `id`: the filter produces a set of matching ids, and
+similarity ranks within those ids. Concretely:
+
+- **No filter** → the pool is the whole collection. The query vector is compared against
+  every stored vector and you get the global top-k. This is what failed for the Japan fund:
+  the right chunk existed, but 520 other funds' near-identical boilerplate out-ranked it, so
+  it was not even in the top-200.
+- **With a filter** → the pool shrinks to only the matching chunks (equality on `filename`
+  gave 6 chunks for that PDF). The query vector is then compared *only within those 6*, so the
+  charges chunk came back at **rank #1** — even though globally it was ~rank 800.
+
+The metadata did not "help rank it higher" — it *removed the competition*. Three consequences
+worth internalizing:
+
+1. **A filter never adds a score; it only includes/excludes.** No "boost this chunk by +0.2
+   because its metadata matches." A chunk that fails the `where` is simply not in the pool.
+   Over-selective filters starve the LLM (see the caveats below).
+2. **The query embedding is never compared to metadata.** Vectors compare only to vectors;
+   metadata is consulted separately to decide the pool.
+3. **Because the filter runs first, `k` counts *within the pool*.** `k=5` + a filter means 5
+   chunks from that file, not 5 from the whole store — so scope by metadata with a `k` large
+   enough to still answer. (What this is *not* — hybrid search — is unpacked below.)
+
+### Filtered vector search vs. hybrid search
+
+Filtering by metadata is **not** hybrid search — the terms get conflated, and the distinction
+matters for what you build:
+
+| Technique | What runs | How results combine |
+|---|---|---|
+| **Pure vector search** | one dense retriever (cosine) | rank by the one similarity score |
+| **Filtered vector search** (this system) | one dense retriever, gated by a `where` constraint | metadata **excludes** non-matching chunks (no score); similarity ranks the rest |
+| **Hybrid search** | **two score-producing retrievers** (e.g. BM25 keyword + dense vector) | both return ranked lists, then the two scores are **fused** |
+
+The tell-tale question is: *does the second signal produce a score that gets blended, or is it
+just a gate?*
+
+- A metadata filter is a **gate**. It never scores anything — a chunk either passes `where`
+  or it is out, and only one scoring signal (the vector) survives.
+- Hybrid search runs **two gates and two scorers**, then merges the ranked lists with a fusion
+  strategy — a weighted sum (`0.5·vector + 0.5·bm25`) or RRF (reciprocal rank fusion,
+  `score = Σ 1/(k + rank)`), the usual no-tuning default.
+
+The classic hybrid pair is **sparse + dense**, because each catches the other's misses:
+
+- **Dense** (the embedding you have) captures *meaning* — synonyms, paraphrase. Weak at exact
+  tokens, rare names, and codes.
+- **Sparse / BM25** matches exact *strings* — `IE0007286036`, a precise fund name, product
+  codes. It has no notion of meaning: a synonym that shares no token scores 0.
+
+That is the flip side of the Japan-fund case: pure vector drowned the ISIN among 2,568
+near-identical boilerplate chunks, but a BM25 retriever would have matched the exact string
+instantly — and conversely a question phrased with synonyms would score 0 in BM25 yet rank #1
+in vector.
+
+For an exact code/figure that must be findable, there are three escalating options:
+
+1. **Metadata filter** (scoping) — cheapest; the app knows the fund and injects `filename`.
+2. **Enrichment** — bake the ISIN/name into the chunk *text* that gets embedded, so vector
+   similarity itself can separate the funds (see the caveats below).
+3. **Hybrid search** — add a BM25-style retriever so exact strings score independently; real
+   added complexity (a second index + a fusion strategy), worth it only when queries genuinely
+   mix "meaning questions" and "exact-code questions."
+
+### What metadata is used for
+
+1. **Hard constraints similarity can't express (filtering / scoping).** The killer use case —
+   embed once into one collection, then slice it per query with a `where` filter:
+   - *Access control / tenancy* — `where={"tenant_id": user.tenant}` so a query physically
+     cannot return another tenant's or a confidential document's chunks. How most
+     multi-tenant production RAG is built.
+   - *Recency* — `where={"date": {"$gte": "2026-01-01"}}` to exclude stale documents.
+   - *Domain narrowing* — `where={"filename": "Vanguard Japan ... [IE0007286036].pdf"}` to
+     search one fund's KIID. The app/UI picks the scope; the user just types a question.
+2. **Provenance & citations ("show your sources").** The Q&A `sources` list only exists
+   because each chunk carries `filename` / `page` / char offsets — a path back to the real
+   document, and a way to verify an answer.
+3. **Lifecycle management.** Replace a corrected PDF? Delete only that document's old chunks
+   (`collection.delete(where={"filename": old})`) before re-ingesting — with one shared
+   collection, filename metadata is the only handle that isolates a document.
+4. **Exact structured facts.** Numbers, dates, ISINs, enum values — things that must match
+   *exactly*, not by meaning. `"ISIN IE0007286036"` is queryable with `==` as metadata; baked
+   into prose it's just more words the embedding weighs loosely.
+5. **Debugging & audit.** `chunk_id`, ingest timestamps, embedding-model version, char
+   offsets — answerable "why did the LLM cite this?", and stale-chunk cleanup after a model
+   swap.
+
+### The two caveats (a production design must respect both)
+
+**Metadata does not affect ranking.** It filters *before* or *after* the vector search; it
+never moves a chunk up within the results. For a *ranking* problem — near-duplicate
+boilerplate across many documents where the right chunk isn't even in the top-k — the real
+fix is **enrichment**: bake the fund name / ISIN / key figure into the chunk *text* that gets
+embedded, so similarity itself can separate them. Metadata and enrichment solve different
+failures, and both are needed:
+
+- metadata → *"I want only X's chunks"* (hard scoping, security, attribution)
+- enrichment → *"the right chunk should rank highest"* (semantic disambiguation)
+
+**Filters have sharp edges.** Over-selective pre-filters leave too few chunks to answer a
+question; post-filters that drop most of the top-k silently starve the LLM. And filter
+operators are *not* portable across vector DBs — chromadb's `$contains` on this build
+silently returned 0 rows for a value that existed (equality worked). In production the system
+injects filters from app context; users never type arbitrary `where` clauses.
+
+### What this means for choosing an embedding model
+
+Model quality and metadata fix *different* retrieval failures. A bigger, "better" embedding
+model will **not** fix a miss caused by a missing filter scope (wrong document, wrong tenant,
+wrong date) — spending compute on a 0.6B model to solve a metadata problem is the wrong
+investment. Evaluate retrieval quality on your own data first, and classify each miss before
+upgrading the model:
+
+| Type of miss | Real fix |
+|---|---|
+| Semantic — right scope, but meaning not captured | Better embedding model, better chunking |
+| Ranking — near-duplicate text pushes the target out of top-k | **Enrichment** — bake discriminating facts into the chunk text |
+| Scope — right facts, wrong document / tenant / date | **Metadata filter** injected by the app |
+| Both scope + ranking | Metadata filter + enrichment together |
+
+---
+
 ## Decision workflow
 
 ```
@@ -182,7 +351,7 @@ instruction-aware model needs its prompt wired in at the query call sites to rea
 
 | Model | Dim | Max ctx | Params | Lang | License | Notes |
 |---|---|---|---|---|---|---|
-| `all-MiniLM-L6-v2` | 384 | 256 | 22M | EN | MIT | Current default. Fast, but truncates 512-token chunks. |
+| `all-MiniLM-L6-v2` | 384 | 256 | 22M | EN | MIT | Current default. Fast; truncates chunks longer than 256 tokens. |
 | `BAAI/bge-base-en-v1.5` | 768 | 512 | 109M | EN | MIT | Natural upgrade: fits chunk size exactly, better quality, still CPU-friendly. |
 | `BAAI/bge-m3` | 1024 | 8192 | 568M | multi | MIT | Multilingual + huge context, ~5× slower than MiniLM on CPU. |
 | `intfloat/multilingual-e5-large` | 1024 | 512 | 560M | multi | MIT | Strong multilingual baseline; needs `query:` / `passage:` prefixes. |
@@ -220,4 +389,5 @@ instruction-aware model needs its prompt wired in at the query call sites to rea
 **Bottom line:** an embedding model is not better "in the abstract" — it is better for your
 language, your chunk size, your hardware, your privacy posture, and your measured retrieval
 recall. For this exact codebase the two constraints that matter most are **context window ≥
-chunk size** (currently violated by the default) and **CPU inference speed**.
+chunk size** (the default chunk size is now 200, inside MiniLM's 256-token window) and
+**CPU inference speed**.
