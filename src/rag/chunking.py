@@ -18,7 +18,7 @@ class DocumentChunker:
     
     def __init__(
         self,
-        chunk_size: int = 512,
+        chunk_size: int = 200,
         chunk_overlap: int = 50,
         encoding_name: str = "cl100k_base"
     ):
