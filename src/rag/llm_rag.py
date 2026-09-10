@@ -253,31 +253,6 @@ class LLMRAGPipeline:
             f"provider={self.llm_config.provider}, model={self.llm_config.model}, "
             f"base_url={self.llm_config.base_url})"
         )
-
-    # def _build_context_and_sources(
-    #     self, hits: Sequence[Dict[str, Any]]
-    # ) -> Tuple[str, List[Dict[str, Any]]]:
-    #     """
-    #     Combine retrieved chunks into a single context string and normalized sources.
-    #     Expects hits from RAGPipeline.vector_store.similarity_search(...)
-    #     """
-    #     context_lines: List[str] = []
-    #     sources: List[Dict[str, Any]] = []
-
-    #     for idx, h in enumerate(hits, start=1):
-    #         text = h.get("text") or h.get("page_content") or ""
-    #         meta = h.get("metadata") or {}
-    #         source = {
-    #             "rank": idx,
-    #             "score": h.get("score"),
-    #             "filename": meta.get("filename") or meta.get("source") or meta.get("file_path"),
-    #             "page": meta.get("page"),
-    #             "id": meta.get("id") or meta.get("doc_id"),
-    #         }
-    #         context_lines.append(f"[{idx}] {text}")
-    #         sources.append(source)
-
-    #     return "\n\n".join(context_lines), sources
     
 
     def _build_context_and_sources(
@@ -305,6 +280,7 @@ class LLMRAGPipeline:
             sources.append(source)
 
         return "\n\n".join(context_lines), sources
+    
     def build_messages(
         self,
         query: str,
